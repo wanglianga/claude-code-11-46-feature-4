@@ -9,6 +9,10 @@ Exercises the acceptance criteria over HTTP:
   5. publishing mid-traffic never mixes versions
   6. offline (training replay) and online reads at the same as_of match
   7. unavailable account source reports status instead of fake zeros
+  8. replay package manifest + integrity verification + repeated replay equality
+  9. retention expiry: digest provable, plaintext unreplayable (never claimed)
+ 10. policy change midway through manifest generation uses the start snapshot
+ 11. source re-upload correction breaks the evidence chain with affected scores
 
 Usage:  python scripts/verify_e2e.py [base_url]
 Requires the backend running (default http://127.0.0.1:8000) with a fresh-ish
@@ -174,6 +178,126 @@ def main():
     cnt = next(f for f in resp_out["features"] if f["name"] == "txn_count_1h")
     check("交易类特征不受账户源影响", cnt["status"] == "ok")
     req("POST", "/api/sources/outage", {"source": "account_profiles", "status": "ok", "message": ""}, token)
+
+    # ======================= replay & retention governance ===================
+    admin = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})["token"]
+
+    def approve(package_id, scope):
+        a = req("POST", f"/api/replay-packages/{package_id}/approvals",
+                {"scope": scope, "reason": "e2e 审计复现"}, token)
+        req("POST", f"/api/approvals/{a['id']}/decide", {"approve": True, "note": "ok"}, admin)
+
+    batch = req("POST", "/api/model-batches", {
+        "batch_key": f"BATCH-E2E-{RUN}", "model_name": "fraud_blocker",
+        "sample_ids": [s["id"]], "freeze": True,
+    }, token)
+    check("批次冻结后记录输入摘要", batch["status"] == "frozen" and bool(batch["input_digest"]))
+
+    pkg = req("POST", "/api/replay-packages", {"batch_id": batch["id"]}, token)
+    manifest = pkg["manifest"]
+    check("复现清单含数据范围/事件顺序/字段可用性/特征值/标签成熟度/环境指纹/完整性校验",
+          all(k in manifest for k in ("data_scope", "event_order", "samples", "environment", "integrity"))
+          and manifest["samples"][0]["features"]
+          and any(i["fields"] for f in manifest["samples"][0]["features"] for i in f["inputs"]))
+    check("清单不包含原始个人明细（仅摘要）",
+          "M100" not in json.dumps(manifest, ensure_ascii=False))
+
+    verify = req("GET", f"/api/replay-packages/{pkg['id']}/verify", token=token)
+    check("清单完整性校验通过且可重放",
+          verify["manifest_checksum_ok"] and verify["manifest_digest_ok"] and verify["replayable"])
+    try:
+        req("POST", f"/api/replay-packages/{pkg['id']}/replay", token=token)
+        check("未审批的重放被拒绝", False)
+    except urllib.error.HTTPError as exc:
+        check("未审批的重放被拒绝", exc.code == 403)
+
+    approve(pkg["id"], "replay")
+    run1 = req("POST", f"/api/replay-packages/{pkg['id']}/replay", token=token)
+    run2 = req("POST", f"/api/replay-packages/{pkg['id']}/replay", token=token)
+    check("同一模型多次重放结果一致",
+          run1["run"]["status"] == "consistent"
+          and run1["run"]["result_digest"] == run2["run"]["result_digest"])
+
+    deps = req("GET", f"/api/replay-packages/{pkg['id']}/dependencies", token=token)
+    check("审计员可从一份复现包查到全部依赖版本",
+          {"data_retention", "feature_compute", "model_batch", "evidence_packaging",
+           "approval", "audit_query"} <= set(deps["holders"]))
+
+    # --- retention expiry -----------------------------------------------------
+    future = (now + timedelta(days=800)).isoformat()
+    sweep = req("POST", "/api/retention/sweeps", {"as_of": future}, token=token)
+    check("保留期届满执行清理", sweep["status"] == "completed" and sweep["records_expired"] >= 0)
+    expired = req("GET", f"/api/replay-packages/{pkg['id']}/verify", token=token)
+    check("过期后原文不可用但摘要仍可验证",
+          expired["overall_classification"] in ("plaintext_unavailable", "evidence_chain_broken")
+          or expired["replayable"] is False)
+    check("不可复现的记录不被宣称已复现",
+          all(r["replayable"] is False for r in expired["samples"]
+              if r["classification"] == "plaintext_unavailable"))
+
+    # --- policy update midway -------------------------------------------------
+    batch2 = req("POST", "/api/model-batches", {
+        "batch_key": f"BATCH-E2E-MID-{RUN}", "model_name": "fraud_blocker",
+        "sample_ids": [s["id"]], "freeze": True,
+    }, token)
+    mid = req("POST", "/api/replay-packages", {
+        "batch_id": batch2["id"], "package_key": f"PKG-MID-{RUN}", "pause_before_seal": True,
+    }, token)
+    old_v = mid["policy_version"]
+    policies = req("GET", "/api/retention/policies", token=token)
+    rules = json.loads(json.dumps(policies[0]["rules"]))
+    rules["transaction_detail"]["plaintext_days"] = max(
+        1, min(7, rules["transaction_detail"]["protected_copy_days"])
+    )
+    newp = req("POST", "/api/retention/policies", {
+        "rules": rules, "digest_algorithm": "sha256", "note": "e2e midway change",
+    }, token)
+    req("POST", f"/api/replay-packages/{mid['id']}/seal", token=token)
+    sealed = req("GET", f"/api/replay-packages/{mid['id']}/manifest", token=token)
+    check("清单生成中途策略更新仍使用启动时冻结策略",
+          newp["version"] > old_v
+          and sealed["manifest"]["seal"]["policy"]["used_snapshot"] is True
+          and sealed["manifest"]["policy"]["version"] == old_v)
+
+    # --- source re-upload correction -----------------------------------------
+    req("POST", "/api/source-corrections", {
+        "record_id": e2["txn_id"], "amount": 4321.0, "note": "e2e 来源补传",
+    }, token)
+    broken = req("GET", f"/api/replay-packages/{pkg['id']}/verify", token=token)
+    check("来源补传修改导致证据链损坏并列出受影响评分",
+          broken["overall_classification"] == "evidence_chain_broken"
+          and len(broken["affected_scores"]) >= 1)
+
+    # --- key revocation then restore (transaction-only package) --------------
+    noprof = f"ACC-E2E-NOPROF-{RUN}"
+    req("POST", "/api/ingest/transactions", [
+        txn(60, noprof, t(hours=-2), 70.0),
+        txn(61, noprof, t(minutes=-40), 80.0),
+    ], token)
+    s_np = req("POST", "/api/training/samples", {
+        "sample_key": f"S-E2E-NOPROF-{RUN}", "entity_id": noprof,
+        "decision_time": t(minutes=-20),
+    }, token)
+    b_np = req("POST", "/api/model-batches", {
+        "batch_key": f"BATCH-E2E-KEY-{RUN}", "model_name": "fraud_blocker",
+        "sample_ids": [s_np["id"]], "freeze": True,
+    }, token)
+    p_np = req("POST", "/api/replay-packages", {"batch_id": b_np["id"]}, token)
+    req("POST", "/api/retention/sweeps", {"as_of": (now + timedelta(days=60)).isoformat()}, token)
+    keys = req("GET", "/api/keys", token=token)
+    active_key = next(k for k in keys if k["status"] == "active")
+    req("POST", f"/api/keys/{active_key['id']}/revoke", {"reason": "e2e 撤销"}, admin)
+    revoked = req("GET", f"/api/replay-packages/{p_np['id']}/verify", token=token)
+    check("密钥撤销后加密副本锁定且不宣称可复现",
+          revoked["overall_classification"] == "plaintext_unavailable"
+          and any(r["state"] == "encrypted_locked" for r in revoked["records"]))
+    req("POST", f"/api/keys/{active_key['id']}/restore", {"reason": "e2e 恢复"}, admin)
+    approve(p_np["id"], "replay")
+    restored = req("GET", f"/api/replay-packages/{p_np['id']}/verify", token=token)
+    rerun = req("POST", f"/api/replay-packages/{p_np['id']}/replay", token=token)
+    check("密钥撤销恢复后可在受控环境重放",
+          restored["overall_classification"] == "replayable_encrypted"
+          and rerun["run"]["status"] == "consistent")
 
     print(f"\n全部 {len(passed)} 项端到端验收检查通过。")
 

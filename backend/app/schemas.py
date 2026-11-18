@@ -104,3 +104,67 @@ class SourceOutageIn(BaseModel):
     source: str = Field(pattern="^(transactions|account_profiles|labels)$")
     status: str = Field(pattern="^(ok|degraded|unavailable)$")
     message: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Replay & retention governance
+# ---------------------------------------------------------------------------
+class ModelIn(BaseModel):
+    name: str = "fraud_blocker"
+    description: str = ""
+    weights: dict[str, float]
+    bias: float = 0.0
+    threshold: float = 0.5
+    missing_value: float = 0.0
+
+
+class BatchIn(BaseModel):
+    batch_key: str
+    model_name: str = "fraud_blocker"
+    model_version: int | None = None
+    feature_set: str = "fraud_scoring"
+    set_version: int | None = None
+    sample_ids: list[int] | None = None
+    freeze: bool = True
+
+
+class PackageIn(BaseModel):
+    batch_id: int
+    package_key: str | None = None
+    pause_before_seal: bool = False
+
+
+class PolicyIn(BaseModel):
+    rules: dict
+    digest_algorithm: str = "sha256"
+    note: str = ""
+
+
+class SweepIn(BaseModel):
+    as_of: datetime | None = None
+
+
+class ApprovalRequestIn(BaseModel):
+    scope: str = Field(pattern="^(replay|plaintext)$")
+    reason: str = ""
+
+
+class ApprovalDecisionIn(BaseModel):
+    approve: bool
+    note: str = ""
+
+
+class RevealIn(BaseModel):
+    category: str | None = None
+
+
+class KeyActionIn(BaseModel):
+    reason: str = ""
+
+
+class SourceCorrectionIn(BaseModel):
+    record_id: str
+    amount: float | None = None
+    merchant_id: str | None = None
+    type: str | None = None
+    note: str = ""

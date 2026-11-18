@@ -6,12 +6,14 @@ import Compute from './pages/Compute.jsx'
 import Online from './pages/Online.jsx'
 import Training from './pages/Training.jsx'
 import Simulate from './pages/Simulate.jsx'
+import Replay from './pages/Replay.jsx'
 
 const TABS = [
   { key: 'catalog', label: '特征目录' },
   { key: 'compute', label: '计算状态' },
   { key: 'online', label: '在线查询' },
   { key: 'training', label: '训练样本' },
+  { key: 'replay', label: '复现与留档' },
   { key: 'simulate', label: '数据模拟' },
 ]
 
@@ -74,6 +76,7 @@ export default function App() {
         {tab === 'compute' && <Compute />}
         {tab === 'online' && <Online />}
         {tab === 'training' && <Training />}
+        {tab === 'replay' && <Replay />}
         {tab === 'simulate' && <Simulate />}
       </main>
     </div>

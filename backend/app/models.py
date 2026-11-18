@@ -319,3 +319,267 @@ class Dataset(Base):
     rows: Mapped[list] = mapped_column(JSONB)
     created_by: Mapped[str] = mapped_column(String(64), default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Replay & retention governance
+#
+# Six independently stateful holders are modelled:
+#   * retention policy versions + sweep jobs   (data retention)
+#   * feature catalog compute snapshot         (feature computation, above)
+#   * model batches                            (model batch)
+#   * replay packages + evidence records       (evidence packaging)
+#   * approvals                                (permission approval)
+#   * audit queries                            (audit query)
+# ---------------------------------------------------------------------------
+class ModelVersion(Base):
+    """An immutable model artefact: a deterministic scoring spec plus digest.
+
+    Scores are a pure function of the feature values and this spec, so the same
+    frozen model can be replayed many times and compared bit-for-bit.
+    """
+
+    __tablename__ = "model_versions"
+    __table_args__ = (UniqueConstraint("name", "version", name="uq_model_name_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    description: Mapped[str] = mapped_column(Text, default="")
+    spec: Mapped[dict] = mapped_column(JSONB)  # {"weights": {...}, "bias": x, "threshold": t}
+    digest: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active | retired
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ModelBatch(Base):
+    """A frozen set of model + feature-set version + input samples.
+
+    Once frozen it is immutable; a replay package can only be built from a
+    frozen batch.
+    """
+
+    __tablename__ = "model_batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_key: Mapped[str] = mapped_column(String(128), unique=True)
+    model_version_id: Mapped[int] = mapped_column(ForeignKey("model_versions.id"))
+    feature_set_name: Mapped[str] = mapped_column(String(128))
+    feature_set_version_id: Mapped[int] = mapped_column(ForeignKey("feature_set_versions.id"))
+    sample_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="draft")  # draft | frozen | superseded
+    input_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    compute_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RetentionPolicy(Base):
+    """An immutable, versioned retention policy per data category.
+
+    Packages snapshot the full policy at build start; later versions never
+    retroactively change an in-flight or sealed package.
+    """
+
+    __tablename__ = "retention_policies"
+    __table_args__ = (UniqueConstraint("version", name="uq_retention_policy_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active | superseded
+    digest_algorithm: Mapped[str] = mapped_column(String(16), default="sha256")
+    rules: Mapped[dict] = mapped_column(JSONB)  # category -> rule
+    rules_digest: Mapped[str] = mapped_column(String(128))
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RetentionSweep(Base):
+    """One execution of retention expiry enforcement (a stateful job)."""
+
+    __tablename__ = "retention_sweeps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    policy_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("retention_policies.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running | completed
+    records_expired: Mapped[int] = mapped_column(Integer, default=0)
+    archives_destroyed: Mapped[int] = mapped_column(Integer, default=0)
+    details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    executed_by: Mapped[str] = mapped_column(String(64), default="system")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KeyVersion(Base):
+    """A wrapping/encryption key version used for encrypted evidence copies.
+
+    status: active (used for new encryption) | retired (decrypt only) |
+    revoked (decryption blocked until restored). Rotation never invalidates
+    old packages; revocation is a recoverable access-control state.
+    """
+
+    __tablename__ = "key_versions"
+    __table_args__ = (UniqueConstraint("version", name="uq_key_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(Integer)
+    algorithm: Mapped[str] = mapped_column(String(32), default="AES-256-GCM")
+    secret: Mapped[str] = mapped_column(String(256))  # base64-encoded key material (demo KMS)
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KeyEvent(Base):
+    __tablename__ = "key_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key_version_id: Mapped[int] = mapped_column(ForeignKey("key_versions.id"), index=True)
+    action: Mapped[str] = mapped_column(String(16))  # rotate | revoke | restore
+    actor: Mapped[str] = mapped_column(String(64))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplayPackage(Base):
+    """An evidence package (复现清单) for one frozen model batch.
+
+    status: building -> sealed. While building, the policy snapshot taken at
+    start is authoritative even if a new policy version is published midway.
+    """
+
+    __tablename__ = "replay_packages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_key: Mapped[str] = mapped_column(String(160), unique=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("model_batches.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="building")  # building | sealed
+    policy_version_id: Mapped[int] = mapped_column(ForeignKey("retention_policies.id"))
+    policy_snapshot: Mapped[dict] = mapped_column(JSONB)
+    environment: Mapped[dict] = mapped_column(JSONB)
+    digest_algorithm: Mapped[str] = mapped_column(String(16), default="sha256")
+    manifest: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    manifest_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class EvidenceRecord(Base):
+    """One captured input record inside a package.
+
+    The payload digest is retained even after the plaintext (and any encrypted
+    copy) is gone, so auditors can still prove which inputs were used.
+    """
+
+    __tablename__ = "evidence_records"
+    __table_args__ = (
+        UniqueConstraint("package_id", "record_key", name="uq_evidence_record"),
+        Index("ix_evidence_package", "package_id", "category"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("replay_packages.id"), index=True)
+    record_key: Mapped[str] = mapped_column(String(256))
+    category: Mapped[str] = mapped_column(String(32))
+    record_id: Mapped[str] = mapped_column(String(256))
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    payload_digest: Mapped[str] = mapped_column(String(128))
+    digest_algorithm: Mapped[str] = mapped_column(String(16), default="sha256")
+    strategy: Mapped[str] = mapped_column(String(32))  # encrypted_copy | digest_only
+    plaintext_state: Mapped[str] = mapped_column(String(16), default="retained")  # retained|purged|destroyed
+    plaintext_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    archive_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Captured plaintext of the record while it is inside its plaintext window.
+    # A retention sweep nulls it; the encrypted copy (if the category's policy
+    # keeps one) survives until archive_until.
+    plaintext_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    encrypted_blob: Mapped[str | None] = mapped_column(Text, nullable=True)
+    key_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("key_versions.id"), nullable=True
+    )
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Approval(Base):
+    """Access approval state machine: requested -> approved | rejected."""
+
+    __tablename__ = "approvals"
+    __table_args__ = (Index("ix_approval_package_scope", "package_id", "scope", "status"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("replay_packages.id"), index=True)
+    scope: Mapped[str] = mapped_column(String(16))  # replay | plaintext
+    status: Mapped[str] = mapped_column(String(16), default="requested")
+    requested_by: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplayRun(Base):
+    """One controlled replay attempt of a sealed package."""
+
+    __tablename__ = "replay_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("replay_packages.id"), index=True)
+    run_number: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32))  # consistent | mismatch | not_replayable
+    classification: Mapped[str] = mapped_column(String(32))
+    result_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    environment_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    affected_scores: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    executed_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuditQuery(Base):
+    """Audit-side query log; each entry holds its own running/completed state."""
+
+    __tablename__ = "audit_queries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[int | None] = mapped_column(
+        ForeignKey("replay_packages.id"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(32))  # verify | replay | reveal | dependencies | sweep
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running | completed | failed
+    actor: Mapped[str] = mapped_column(String(64))
+    summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SourceCorrection(Base):
+    """Audit trail for a corrected upstream re-upload (drill / real correction).
+
+    A correction after a package was sealed makes the captured digest differ
+    from the canonical record, which verification reports as an evidence-chain
+    break rather than silently re-replaying changed data.
+    """
+
+    __tablename__ = "source_corrections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category: Mapped[str] = mapped_column(String(32))
+    record_id: Mapped[str] = mapped_column(String(256))
+    old_digest: Mapped[str] = mapped_column(String(128))
+    new_digest: Mapped[str] = mapped_column(String(128))
+    note: Mapped[str] = mapped_column(Text, default="")
+    corrected_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

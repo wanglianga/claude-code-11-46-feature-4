@@ -42,6 +42,15 @@ def create_session(db: Session, user: User) -> str:
     return token
 
 
+def require_role(*roles: str):
+    """Dependency factory: the current user must hold one of the given roles."""
+    def _dep(user: User = Depends(current_user)) -> User:
+        if user.role not in roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "insufficient role")
+        return user
+    return _dep
+
+
 def current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: Session = Depends(get_db),

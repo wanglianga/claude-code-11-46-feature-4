@@ -61,17 +61,19 @@ def mark_source_success(db: Session, source: str, at: datetime | None = None) ->
     row.message = ""
 
 
-def _window_bounds(as_of: datetime, window_seconds: int) -> tuple[datetime, datetime]:
+def window_bounds(as_of: datetime, window_seconds: int) -> tuple[datetime, datetime]:
     """(start, end] with start = as_of - W (exclusive), end = as_of (inclusive)."""
     return as_of - timedelta(seconds=window_seconds), as_of
 
 
-def _aggregate(entries: list[WindowEntry], aggregation: str) -> float | int | None:
+def aggregate_values(amounts: list, aggregation: str) -> float | int | None:
+    """Aggregate pre-selected contribution amounts with the same semantics as
+    the live window engine. Shared by serving and evidence replay so a
+    reproduced value uses the identical arithmetic."""
     if aggregation == "COUNT":
-        return len(entries)
-    values = [float(e.amount) for e in entries if e.amount is not None]
+        return len(amounts)
+    values = [float(a) for a in amounts if a is not None]
     if not values:
-        # SUM of an empty window is honestly 0; AVG/MIN/MAX are undefined.
         return 0 if aggregation == "SUM" else None
     if aggregation == "SUM":
         return sum(values)
@@ -82,6 +84,11 @@ def _aggregate(entries: list[WindowEntry], aggregation: str) -> float | int | No
     if aggregation == "MAX":
         return max(values)
     raise ValueError(f"unsupported aggregation {aggregation}")
+
+
+def _aggregate(entries: list[WindowEntry], aggregation: str) -> float | int | None:
+    # SUM of an empty window is honestly 0; AVG/MIN/MAX are undefined.
+    return aggregate_values([e.amount for e in entries], aggregation)
 
 
 def compute_feature_value(
@@ -99,7 +106,7 @@ def compute_feature_value(
     if src is not None and src.status == "unavailable":
         raise SourceUnavailable(feature.source, src.status, src.last_success_at, src.message)
 
-    start, end = _window_bounds(as_of, feature.window_seconds or 0)
+    start, end = window_bounds(as_of, feature.window_seconds or 0)
     entries = (
         db.execute(
             select(WindowEntry)
@@ -146,7 +153,7 @@ def window_contributions(
 ) -> list[WindowEntry]:
     """The maintained-state entries contributing to the value at as_of.
     Used for training lineage (which input records produced the value)."""
-    start, end = _window_bounds(as_of, feature.window_seconds or 0)
+    start, end = window_bounds(as_of, feature.window_seconds or 0)
     return list(
         db.execute(
             select(WindowEntry)

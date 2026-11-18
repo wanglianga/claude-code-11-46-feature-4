@@ -141,6 +141,7 @@ def trace_sample(
                                 "account_id": txn.account_id,
                                 "event_time": txn.event_time.isoformat(),
                                 "amount": float(txn.amount),
+                                "currency": txn.currency,
                                 "type": txn.type,
                                 "status": txn.status,
                                 "merchant_id": txn.merchant_id,
